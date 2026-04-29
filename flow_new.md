@@ -6,8 +6,8 @@
 flowchart TD
     UI[網頁/桌面 GUI<br/>app_web.py / app_gui.py] -->|一鍵執行| S1
     A[Google Sheet<br/>運單對照 beta] -->|Sheets API + OAuth<br/>讀取 cell 背景色| S1[fetch_empty_waybill.py]
-    S1 -->|過濾 白底 + F 欄空白| C[empty_waybill.csv<br/>40 筆未發貨訂單]
-    C -->|min/max 訂購日期| D[日期區間<br/>2026-04-21 ~ 2026-04-27]
+    S1 -->|白底 + 長數字訂單 + F 欄空白| C[empty_waybill.csv<br/>含 order_time C欄訂購時間]
+    C -->|order_time 取前10字<br/>min = 最前 / max = 最後| D[日期區間<br/>YYYY-MM-DD ~ YYYY-MM-DD]
 
     D --> S2[filter_orders_by_date.py]
     S2 -->|cookies_header.txt| F[Playwright<br/>開 1688 訂單頁]
@@ -46,9 +46,26 @@ flowchart TD
 - 訂單編號是長數字(>10 位)
 - F 欄(運單號)為空
 
+**🔑 1688 日期偵測邏輯**(這是後面要丟給 1688「下單時間」篩選的關鍵):
+
+| 步驟 | 來源 / 動作 |
+|---|---|
+| 1. 鎖定欄位 | **C 欄 (index 2) `訂購時間`** — 不是付款時間、不是更新日 |
+| 2. 過濾資料 | 上述 3 條件(白底 + 長數字訂單編號 + F 空)|
+| 3. 取日期 | 各列 `訂購時間` 字串前 10 字 `YYYY-MM-DD`(去掉時分秒)|
+| 4. 計算範圍 | 字串排序後 `dates[0]` = 最前、`dates[-1]` = 最後 |
+| 5. 傳遞 | 寫入 `empty_waybill.csv` 的 `order_time` 欄,階段 2 再透過 `get_date_range()` 讀回 |
+
+範例:今天跑出的 25 筆資料分布在 4/21、4/24、4/27 → 偵測結果 = `2026-04-21 ~ 2026-04-27`,後面 1688 「下單時間」就會自動套這個區間。
+
+**為什麼用「訂購時間」而非「付款時間」**:
+- 訂購時間每筆訂單都有(下單即產生),最穩定
+- 付款時間可能空白(未付款訂單,例如 18 筆未付款)
+- 1688 下單時間篩選的語義也是 `訂購` 那刻
+
 **輸出**:
-- `empty_waybill.csv` — 待補運單訂單明細
-- 印出最早 / 最晚訂購日期
+- `empty_waybill.csv` — 待補運單訂單明細(包含 order_time 欄供下游使用)
+- 印出 `=== 最前/最後日期 ===` 區段
 
 ### 階段 2: Playwright 自動化 + 精簡 + 回填 (`filter_orders_by_date.py`)
 
@@ -56,15 +73,16 @@ flowchart TD
 
 #### 2-1. 1688 自動操作
 1. 用 `cookies_header.txt` 登入 → 開訂單頁(`tradeStatus=waitbuyerreceive`)
-2. 點「下單時間」`.q-select-selector`
-3. **shadow DOM 穿透**:`<q-date>` 是 Web Component(內含 `<ui-datetime readonly>`),不能直接打字。用 Playwright `locator.evaluate()` 設 `value` 屬性 + 派發 `input/change/q-change` 事件
-4. 點 `q-button:has-text("搜索")`
-5. 點 `q-button:has-text("导出当前条件")`
-6. 對話框實心 primary `q-button[type="primary"][modal-component="true"]:not([outline]):visible`(過濾隱藏模板)
-7. 等 10 秒
-8. 對話框 outline primary 展開記錄
-9. 抓最新下載連結 `q-table-td.export-record-td a`(第一列)
-10. `expect_download()` 接 xlsx → 存到本地
+2. **`get_date_range()`** 從 `empty_waybill.csv` 讀 `order_time` 欄 → 排序取最前/最後當作 1688 篩選日期
+3. 點「下單時間」`.q-select-selector`
+4. **shadow DOM 穿透**:`<q-date>` 是 Web Component(內含 `<ui-datetime readonly>`),不能直接打字。用 Playwright `locator.evaluate()` 設 `value = "YYYY-MM-DD"` 屬性 + 派發 `input/change/q-change` 事件 — 兩個 `<q-date>` 分別填最前 / 最後日期
+5. 點 `q-button:has-text("搜索")`
+6. 點 `q-button:has-text("导出当前条件")`
+7. 對話框實心 primary `q-button[type="primary"][modal-component="true"]:not([outline]):visible`(過濾隱藏模板)
+8. 等 10 秒
+9. 對話框 outline primary 展開記錄
+10. 抓最新下載連結 `q-table-td.export-record-td a`(第一列)
+11. `expect_download()` 接 xlsx → 存到本地
 
 #### 2-2. 精簡 xlsx (`trim_xlsx` 函式)
 - `openpyxl` 重建只含「訂單編號 / 運單號」兩欄的新檔

@@ -4,112 +4,195 @@
 
 ```mermaid
 flowchart TD
-    A[Google Sheet<br/>運單對照 beta] -->|Sheets API + OAuth<br/>讀取 cell 背景色| B[fetch_empty_waybill.py]
-    B -->|過濾條件<br/>白底 + 運單號空白| C[empty_waybill.csv<br/>24 筆未發貨訂單]
-    C -->|min/max 訂購日期| D[日期區間<br/>2026-04-04 ~ 2026-04-23]
+    UI[網頁/桌面 GUI<br/>app_web.py / app_gui.py] -->|一鍵執行| S1
 
-    D --> E[filter_orders_by_date.py]
-    E -->|cookies_header.txt<br/>登入態| F[Playwright<br/>開 1688 訂單頁]
+    subgraph GAS["☁️ Google Apps Script Web App"]
+        direction LR
+        GASEP{{HTTPS endpoint<br/>?action=...&token=...}}
+        GASEP --> EP1[getDateRange<br/>讀 B1 + 計算昨天]
+        GASEP --> EP2[getEmptyWaybills<br/>讀 cell 背景色 + 過濾]
+        GASEP --> EP3[updateWaybills<br/>套規則 + setBackground]
+    end
 
-    F --> G[點擊 下單時間 下拉<br/>.q-select-selector]
+    A[(Google Sheet<br/>運單對照 beta)]
+    GAS <-->|SpreadsheetApp| A
+
+    S1[fetch_empty_waybill.py] -->|HTTP GET<br/>?action=getEmptyWaybills| GASEP
+    S1 --> C[empty_waybill.csv<br/>含 order_time C欄訂購時間]
+
+    UI --> S2[filter_orders_by_date.py]
+    S2 -->|HTTP GET<br/>?action=getDateRange| GASEP
+    S2 -->|cookies / storage_state| F[Playwright<br/>開 1688 訂單頁]
+    F --> G[點下單時間下拉]
     G --> H[JS 設 q-date value<br/>穿透 shadow DOM]
-    H --> I[點 搜索<br/>q-button:has-text 搜索]
-    I --> J[點 導出當前條件<br/>q-button outline mini]
-    J --> K[對話框 確認導出<br/>q-button type=primary]
-    K -->|等 10 秒| L[對話框 outline primary<br/>查看記錄]
-    L --> M[抓最新下載連結<br/>q-table-td.export-record-td a]
-    M -->|expect_download| N[xxx.xlsx<br/>225 列 49 欄]
+    H --> I[搜索 → 導出當前條件]
+    I --> K[對話框 確認導出]
+    K -->|等 10 秒| L[對話框 outline<br/>展開記錄]
+    L --> M[抓最新下載連結]
+    M -->|expect_download| N[xxx.xlsx<br/>~225 列 49 欄]
 
-    N --> O[trim_xlsx.py]
-    O -->|保留 A 訂單編號<br/>+ AF 運單號| P[xxx_trimmed.xlsx<br/>225 列 2 欄]
+    N --> T[trim_xlsx 函式]
+    T -->|保留 A 訂單編號 + AF 運單號<br/>移除重複合併列| P[xxx_trimmed.xlsx<br/>~138 列 2 欄]
+
+    P --> U[update_waybills 函式]
+    U -->|HTTP POST<br/>?action=updateWaybills<br/>body={mapping}| GASEP
 
     style A fill:#e1f5ff
     style C fill:#fff4e1
     style N fill:#fff4e1
     style P fill:#e1ffe1
+    style UI fill:#ffe1f5
+    style GAS fill:#fff8d4,stroke:#d4a017,stroke-width:2px
 ```
 
-## 三大階段
+## 架構說明
 
-### 階段 1: 從 Google Sheet 取得日期範圍
+**所有與 Google Sheet 的互動,都改走 GAS Web App HTTPS endpoint**:
+- 客戶端**零 OAuth**(不需要 `client_secret.json` / `token.json`)
+- 只需 `gas_config.json` 內含 URL + SECRET_TOKEN 兩個字串
+- 若 `gas_config.json` 不存在,腳本自動 fallback 到原本的 Sheets API + OAuth 路徑(向下相容)
 
-**輸入**: Google Sheet `1TlBDX9TlH1NoxkvL2bfhOzHMPcHRtMwkLd8AlrIzyjQ`,gid `1255614457`(運單對照 beta)
+## 兩階段(GUI 一鍵)
 
-**處理**:
-- OAuth 登入(`client_secret_*.json` → `token.json`)
-- 透過 `spreadsheets.get(includeGridData=True)` 讀取連同格式的儲存格資料
-- 過濾規則:
-  - A 欄背景色 = 白色 `#ffffff`(排除淺灰 1 `#d9d9d9` 已處理 + 淺黃 `#fff2cc` 標題)
-  - 訂單編號是長數字
+### 階段 1: 取空運單清單 (`fetch_empty_waybill.py`)
+
+**API 路徑**:`GET ?action=getEmptyWaybills&token=...`
+
+**GAS 端邏輯**(`gas_backend.gs` 的 `getEmptyWaybills()`):
+- `range.getBackgrounds()` 拿整片背景色矩陣
+- 過濾條件:
+  - A 欄背景 = 白色 `#ffffff`(排除淺灰 1 `#d9d9d9` 已處理)
+  - 訂單編號是長數字(`/^\d{11,}$/`)
   - F 欄(運單號)為空
-- 計算最早 / 最晚訂購日期
+- 用 `range.getDisplayValues()` 拿格式化字串(日期 = `YYYY-MM-DD HH:mm:ss`)
+- 回傳 `{empty: [{row, order_id, order_time, pay_time, address, ...}], total}`
 
-**輸出**:
-- `empty_waybill.csv` — 24 筆白底 + 運單空缺訂單
-- 日期區間: `2026-04-04` ~ `2026-04-23`
+**🔑 1688 日期偵測邏輯**(階段 2 透過 `getDateRange` 取):
 
-### 階段 2: 自動化 1688 操作
+| 步驟 | 來源 / 動作 |
+|---|---|
+| 1. 鎖定 cell | Sheet **B1** ("下次新增數據抓取起始日期" 的值,例如 `5/13`)|
+| 2. GAS 端解析 | `getDisplayValue()` → regex `(\d{1,2})/(\d{1,2})` |
+| 3. 組合日期 | 月日 + 今年 → 若超過今天則回推一年(跨年情境)|
+| 4. 結束日 | `today - 1 day`(昨天)|
+| 5. 回傳 | `{start: "YYYY-MM-DD", end: "YYYY-MM-DD", b1Raw}` |
 
-**輸入**: `empty_waybill.csv`(取日期範圍),`cookies_header.txt`(登入態)
+**輸出**:`empty_waybill.csv` — 待補運單訂單明細
 
-**Playwright 步驟**:
-1. 開啟 `https://air.1688.com/app/ctf-page/trade-order-list/buyer-order-list.html?tradeStatus=waitbuyerreceive...`
-2. 點擊「下單時間」`.q-select-selector`(下拉選單)
-3. **關鍵技巧**: `<q-date>` 是 Web Component(內含 shadow DOM 的 `<ui-datetime readonly>`),無法直接鍵盤輸入。改用 Playwright 的 `locator.evaluate()` 直接設 `value` 屬性 + 派發 `input/change/q-change` 事件
-4. 點搜索 `q-button:has-text("搜索")`
-5. 點「導出當前條件」`q-button:has-text("导出当前条件")`
-6. 對話框實心 primary `q-button[type="primary"][modal-component="true"]:not([outline]):visible`(過濾掉同 DOM 內隱藏的對話框模板)
-7. 等 10 秒讓導出處理
-8. 對話框 outline primary `q-button[type="primary"][modal-component="true"][outline]:visible`(展開記錄)
-9. 取最新一筆下載連結 `q-table-td.export-record-td a`(第一列 = 最新)
-10. `page.expect_download()` 接 xlsx 檔
+### 階段 2: Playwright 自動化 + 精簡 + 回填 (`filter_orders_by_date.py`)
 
-**輸出**: `<timestamp>.xlsx` — 225 列 × 49 欄
+#### 2-1. 1688 自動操作
+1. 用 `storage_state.json`(來自 `setup_login.py` 互動掃 QR)或 `cookies_header.txt` 登入
+2. 進頁面 → **偵測 `#pc-login-modal`**,若有 = cookie 過期,提示跑 setup_login.py
+3. `GASClient().get_date_range()` 取得 `start ~ end`
+4. 點「下單時間」`.q-select-selector`
+5. **shadow DOM 穿透**:`<q-date>` 是 Web Component(內含 `<ui-datetime readonly>`),不能直接打字。用 Playwright `locator.evaluate()` 設 `value` 屬性 + 派發 `input/change/q-change` 事件
+6. 搜索 → 導出當前條件 → 確認對話框 → 等 10 秒 → 展開記錄 → 抓最新下載連結
+7. `expect_download()` 接 xlsx → 存到本地
 
-### 階段 3: 後處理
+#### 2-2. 精簡 xlsx (`trim_xlsx` 函式)
+- `openpyxl` 重建只含「訂單編號 / 運單號」兩欄
+- **去重**:訂單編號為空 + 運單號重複 → 跳過(合併儲存格副作用)
 
-**處理**: `openpyxl` 讀檔,新建只含「訂單編號」「運單號」兩欄的工作簿
+#### 2-3. 回填 Google Sheet (`update_waybills` 函式)
 
-**注意**: 原檔有「同訂單多 SKU」造成的合併儲存格副作用(子列只有運單號,訂單編號為空)
+**API 路徑**:`POST ?action=updateWaybills` body=`{token, mapping: {orderId: waybill}}`
 
-**輸出**: `<timestamp>_trimmed.xlsx`
+**GAS 端邏輯**(`gas_backend.gs` 的 `updateWaybills()`):
+
+| Case | 條件 | F 運單 | G 更新日 | H 狀態 | 底色 |
+|---|---|---|---|---|---|
+| **A1 (升級)** | F 已有 + F == BC(抓出貨表) + H ≠ `>> TW` | (不動) | (不動) | ← `>> TW` | ← 淺灰 1 |
+| A2 (跳過) | F 已有(其他情況) | — | — | — | — |
+| **B (新填)** | F 空 + 在 xlsx mapping + F == BC | ← 寫入 | ← 今天 | ← `>> TW` | ← 淺灰 1 |
+| **B' (新填)** | F 空 + 在 xlsx mapping + F ≠ BC | ← 寫入 | ← 今天 | ← `廠商 >> 倉庫` | (不動) |
+| **C (待發)** | F 空 + 不在 mapping + H 空 | (不動) | (不動) | ← `廠商未發貨` | (不動) |
+
+實作:`setValue()` 逐 cell 寫 + `setBackground()` 整列塗灰
+
+## 介面層
+
+### 網頁版 `app_web.py` (推薦)
+Flask + SSE 即時串流,深色 Consolas 主題
+
+啟動:
+```bash
+python d:/1688excel/app_web.py
+```
+自動開瀏覽器到 `http://127.0.0.1:5000`
+
+按鈕:
+- ▶ **一鍵執行** — 依序跑階段 1→2,後端 thread 不阻塞
+- 📋 **複製全部 LOG** — 含時間戳的完整日誌
+- ⚠ **複製錯誤** — 標紅錯誤行 + 階段標籤
+- ✓ **複製動作摘要** — 「已X / 完成 / 統計」類關鍵動作 + 編號
+- 🗑 **清除** — 重置面板
+
+技術:
+- SSE `/stream` 推送,連線中斷自動重連 + 15s keep-alive
+- 1.5s 輪詢狀態列(目前階段 / 計數)
+
+### 桌面版 `app_gui.py`
+tkinter 內建,功能對等。執行 `python app_gui.py`
 
 ## 檔案清單
 
 | 檔案 | 用途 |
 |---|---|
-| `client_secret_*.json` | Google OAuth 憑證(Desktop App)|
-| `token.json` | OAuth 授權 token(自動產生 / 重複使用)|
-| `cookies_header.txt` | 1688 登入 cookie(瀏覽器 Copy as cURL 取得)|
-| `cookies.txt` | (Netscape 格式 cookies 備份)|
-| `login_1688.py` | 用 cookie 開 1688(早期測試)|
-| `fetch_sheet.py` | 抓 Sheet 中所有「非淺灰底」資料(早期版)|
-| **`fetch_empty_waybill.py`** | **階段 1:輸出 24 筆 + 日期** |
-| **`filter_orders_by_date.py`** | **階段 2:Playwright 自動化 + 下載 xlsx** |
-| **`trim_xlsx.py`** | **階段 3:精簡欄位** |
+| **`gas_backend.gs`** | **GAS 後端**(複製貼到 script.google.com 部署)|
+| **`gas_client.py`** | **Python HTTP 客戶端**(urllib + JSON)|
+| **`gas_config.json`** | **GAS URL + SECRET_TOKEN**(機密,別上傳 git)|
+| `gas_config.example.json` | 設定檔範本 |
+| `GAS_SETUP.md` | GAS 部署完整指南 |
+| **`fetch_empty_waybill.py`** | **階段 1**(優先 GAS,fallback OAuth)|
+| **`filter_orders_by_date.py`** | **階段 2:Playwright + trim + 回填** |
+| **`trim_xlsx.py`** | xlsx 精簡(獨立可跑也可 import)|
+| **`update_waybills.py`** | Sheet 回填邏輯(優先 GAS,fallback OAuth)|
+| **`app_web.py`** | **網頁 GUI(Flask + SSE)** |
+| **`app_gui.py`** | **桌面 GUI(tkinter)** |
+| `setup_login.py` | 一次性互動掃 QR 登入 1688,儲存 storage_state.json |
+| `cookies_header.txt` | (舊)手動複製 1688 cookies(fallback)|
+| `storage_state.json` | Playwright 完整 storage state(setup_login 產生)|
+| `client_secret_*.json` | (舊)Google OAuth 憑證 — 設定 GAS 後可移除 |
+| `token.json` | (舊)OAuth token — 設定 GAS 後可移除 |
 | `empty_waybill.csv` | 階段 1 輸出 |
-| `<timestamp>.xlsx` | 階段 2 下載 |
-| `<timestamp>_trimmed.xlsx` | 階段 3 輸出 |
-| `debug_*.py` / `*.png` | 除錯腳本 / 截圖 |
+| `*.xlsx` / `*_trimmed.xlsx` | 階段 2 下載 / 精簡 |
+| `FLOW.md` | 本文件 |
 
 ## 一鍵執行
 
+**網頁版**:
 ```bash
-# 階段 1: 取得日期範圍 + 訂單清單
-python d:/1688excel/fetch_empty_waybill.py
+python d:/1688excel/app_web.py
+```
 
-# 階段 2: 自動套日期 + 下載 xlsx
-python d:/1688excel/filter_orders_by_date.py
+**命令列**:
+```bash
+python d:/1688excel/fetch_empty_waybill.py     # 階段 1(走 GAS)
+python d:/1688excel/filter_orders_by_date.py   # 階段 2(GAS + Playwright + 回填)
+```
 
-# 階段 3: 精簡為 2 欄
-python d:/1688excel/trim_xlsx.py
+**單獨工具**:
+```bash
+python d:/1688excel/gas_client.py ping          # GAS 連通性測試
+python d:/1688excel/gas_client.py daterange     # 取日期範圍
+python d:/1688excel/gas_client.py empty         # 取空運單清單
+python d:/1688excel/setup_login.py              # 互動掃 QR 更新 1688 storage state
+python d:/1688excel/trim_xlsx.py                # 精簡最新 xlsx
+python d:/1688excel/update_waybills.py          # 用現有 trimmed.xlsx 回填 Sheet
 ```
 
 ## 關鍵踩雷
 
-1. **Google Sheet 顏色判斷**: `淺灰色 1 = #d9d9d9`(±8 容差);`document.querySelector` 搜尋 Sheets API 回傳的 cell 背景需走 `effectiveFormat.backgroundColor` 浮點 0~1 RGB,× 255 換算
-2. **Web Component shadow DOM**: `document.querySelector('q-date')` 找不到(在 shadow root 內);Playwright `page.locator()` 預設能穿透 shadow,但 `page.evaluate()` 不行 — 改用 `locator.evaluate()`
-3. **`readonly` 偽輸入框**: `<q-date>` 內的 `<ui-datetime readonly>` 是顯示用,不能 `.fill()`,要設外層 `<q-date>` 的 `value` 屬性 + 派發事件
-4. **隱藏對話框模板**: 1688 頁面預先把多個 dialog 都塞 DOM,只是 hidden;選器要加 `:visible`
-5. **`accept_downloads=True`**: `browser.new_context()` 預設不接收下載,要顯式開
-6. **openpyxl `delete_cols`**: 不會清除最大欄寬參考,`max_col` 仍會是原值;改用「複製到新 workbook」做法
+1. **GAS 部署後沒改 SECRET_TOKEN**:預設 `change-me-please-2026` 太弱,改完要重新部署(管理部署 → 編輯 → 新版本)
+2. **GAS 改 Code.gs 沒生效**:Apps Script 是「版本」概念,要重新部署「新版本」,URL 不變
+3. **GAS 回傳 Date 物件**:用 `getValues()` 拿日期 cell 會得到 JS Date,要改用 `getDisplayValues()` 拿格式化字串
+4. **GAS Web App quota**:每天 ~20,000 次呼叫上限、單次執行 6 分鐘上限 — 個人用足夠
+5. **1688 cookie 過期**:DevTools Application Tab 複製 cookie 不一定能登入(partition / SameSite / Secure 限制),改跑 `setup_login.py` 互動掃 QR 拿完整 storage state
+6. **Web Component shadow DOM**:`document.querySelector('q-date')` 找不到,Playwright `locator.evaluate()` 才能穿透 shadow
+7. **`readonly` 偽輸入框**:`<q-date>` 不能 `.fill()`,要設 `value` 屬性 + 派發事件
+8. **隱藏對話框模板**:1688 把多個 dialog 都塞 DOM,選器要加 `:visible`
+9. **`accept_downloads=True`**:`browser.new_context()` 預設不接收下載,要顯式開
+10. **openpyxl `delete_cols`**:不會清最大欄寬參考,改用「複製到新 workbook」做法
+11. **訂單編號合併儲存格**:1688 匯出 xlsx 同訂單多 SKU 共用第一列,去重要鎖「重複運單 + 空編號」雙條件
+12. **subprocess 串流**:GUI 跑子腳本要 `python -u` + `PYTHONIOENCODING=utf-8` + `bufsize=1`,輸出才會即時
